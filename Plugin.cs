@@ -167,9 +167,21 @@ namespace TrickyMaddnessLevelHook
             GameObject AIParent = new GameObject("AI Paths Parent");
             AIParent.transform.parent = levelManager.transform;
 
+            // MakerAIPath.m_points is a List of a user-defined [Serializable]
+            // nested class, and Unity fails to deserialize those for
+            // runtime-loaded (BepInEx) assemblies — on custom maps the list
+            // frequently comes back empty (engine limitation; lists of engine
+            // value types, like the race line's List<Vector3> below, are
+            // unaffected). The AI enumerates DIRECT children of pathsParent, so
+            // every AIPath must sit immediately under AIParent.
             var MakerAIPaths = FindObjectsByType(typeof(MakerAIPath), FindObjectsSortMode.None) as MakerAIPath[];
             for (int i = 0; i < MakerAIPaths.Length; i++)
             {
+                // An empty maker path would become an empty AIPath, which is what
+                // sends AI into the 1.5s respawn loop — skip it entirely.
+                if (MakerAIPaths[i].m_points == null || MakerAIPaths[i].m_points.Count == 0)
+                    continue;
+
                 //For all path object
                 var NewPath = MakerAIPaths[i].gameObject.AddComponent<AIPath>();
 
@@ -197,7 +209,11 @@ namespace TrickyMaddnessLevelHook
             {
                 var NewPath = MakerAIPathsDivider[i].gameObject.AddComponent<AIPathDivider>();
 
-                MakerAIPathsDivider[i].transform.parent = AIParent.transform;
+                // The game enumerates DIRECT children of dividersParent — parent
+                // dividers under the transform actually registered as
+                // dividersParent (they used to go under AIParent and were never
+                // found).
+                MakerAIPathsDivider[i].transform.parent = AIPDividerParent.transform;
 
                 NewPath.m_points = MakerAIPathsDivider[i].m_points;
             }
