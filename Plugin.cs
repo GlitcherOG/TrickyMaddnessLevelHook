@@ -44,8 +44,12 @@ namespace TrickyMaddnessLevelHook
         public static Dictionary<int, HashSet<string>> GameShaderKeywords;
         internal static ConfigEntry<bool> levelSelectScroll;
 
+        public static string MapsDir;
+
         private void Awake()
         {
+            // Plugin startup logic
+            Log = Logger;
             Logger.LogInfo($"Plugin {PluginInfo.PLUGIN_GUID} is loaded!");
             ShaderRemap = Config.Bind("Rendering", "ShaderRemap", ShaderRemapMode.Auto,
                 "Rebind a custom map's materials to the game's own shaders when the map's shaders were compiled for another platform (they render magenta otherwise). "
@@ -57,7 +61,9 @@ namespace TrickyMaddnessLevelHook
                 "Scroll the level-select card strip when more cards exist than fit " +
                 "on screen, auto-scrolling to the selected card. When all cards fit, " +
                 "the menu is left pixel-identical to vanilla. Set false to disable.");
-            if (!Directory.Exists(Directory.GetCurrentDirectory() + "\\Maps\\"))
+            MapsDir = ResolveMapsDir();
+            Logger.LogInfo($"Maps directory resolved to: {MapsDir}");
+            if (!Directory.Exists(MapsDir))
             {
                 Directory.CreateDirectory(MapsDir);
             }
