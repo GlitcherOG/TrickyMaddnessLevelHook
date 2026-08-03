@@ -26,6 +26,18 @@ and if it does not find *exactly one* such call in the method — a future game
 update having changed it — it logs a warning and leaves the method completely
 stock rather than guessing which one to rewrite.
 
+## Snow trail on non-Default ground
+
+`SnowTrail`, the ribbon decal the board leaves in the snow, ground-snaps with a
+raycast whose mask is only Unity's `Default` layer. `Snowboarder` treats four
+layers as rideable ground — `Default`, `Ice`, `Rock` and `Metal` — so on ground
+typed as any of the other three the raycast misses every frame and the trail
+simply never appears. The hook widens that mask to the same four layers
+`Snowboarder` uses.
+
+The mask is only ever widened, never narrowed, so ground that already drew a
+trail still draws one.
+
 ## Custom map thumbnails
 
 A custom map can supply its own level-select thumbnail. Drop a PNG next to the

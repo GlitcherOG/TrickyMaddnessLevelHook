@@ -748,6 +748,23 @@ namespace TrickyMaddnessLevelHook
         }
     }
 
+    // SnowTrail (the board's ground-snapped ribbon decal) ground-snaps via a
+    // raycast that only hits Unity layer "Default" (IL-verified: SnowTrail.Start
+    // sets its static layerMask to just 1 << LayerMask.NameToLayer("Default")).
+    // Rideable ground can legitimately be Default(0)/Ice(6)/Rock(7)/Metal(14) -
+    // those are the four layers Snowboarder itself treats as ground - so on any
+    // custom terrain typed onto Ice/Rock/Metal the raycast misses every frame
+    // and the trail never renders. Widen the mask once, right after Start() sets
+    // it, to exactly those four layers.
+    [HarmonyPatch(typeof(SnowTrail), "Start")]
+    public class SnowTrail_Start_LayerMask
+    {
+        [HarmonyPostfix]
+        public static void Postfix()
+        {
+            int rideableMask = (1 << 0) | (1 << 6) | (1 << 7) | (1 << 14);
+            Traverse.Create(typeof(SnowTrail)).Field("layerMask").SetValue(rideableMask);
+        }
     }
 
 
