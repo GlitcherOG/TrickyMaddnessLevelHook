@@ -46,6 +46,54 @@ namespace TrickyMaddnessLevelHook
 
         public static string MapsDir;
 
+        // ── Per-map sidecar ──────────────────────────────────────────────────
+        // A map may ship an optional plain-text file next to its .asset —
+        // "MyMap.asset" -> "MyMap.hook.txt" — whose lines are "<key> <value>"
+        // settings describing the map to the Hook. Nothing is required: a map
+        // without a sidecar, or with a sidecar that declares none of these keys,
+        // behaves exactly as it does today. Unrecognised lines are ignored, so
+        // the file can carry other per-map data too.
+        //
+        // Recognised here:
+        //   platform <windows|mac|linux>  which platform the bundle's shaders
+        //                                 were compiled for. See ShaderRemapEnabled().
+        //   source <slug>                 where the level came from, logged only.
+        //   mapversion <v>                which build of the level this is, logged only.
+        static readonly HashSet<string> SidecarKeys =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "platform", "source", "mapversion" };
+
+        // Sidecar names tried in order. ".hook.txt" is the name to use. The
+        // ".aipaths.txt" fallback is not decoration: a family of converted maps
+        // already ships that file with exactly this header block in it, so
+        // reading it costs one array entry and means those maps declare their
+        // platform to this Hook instead of guessing wrong on somebody's Windows box.
+        static readonly string[] SidecarExtensions = { ".hook.txt", ".aipaths.txt" };
+
+        //Hoisted so the line-splitter isn't reallocated per line of a large sidecar.
+        static readonly char[] KeySeparators = { ' ', '\t' };
+
+        // The only platform slugs that mean anything. A value outside this set is
+        // NOT a declaration — see ReadSidecar. That matters more than it looks:
+        // treating an unknown slug as "declared, and not native" would turn a typo
+        // (or a slug a future Hook understands and this one doesn't) into "remap a
+        // Windows-native bundle on Windows", which is strictly worse than the guess
+        // this feature replaces.
+        static readonly HashSet<string> KnownPlatforms =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "windows", "mac", "linux" };
+
+        // Platform the active custom map declared its shaders were built for, or
+        // null for every map that declares nothing — which is every map that
+        // exists today, and is why this is purely additive.
+        public static string BundleNativePlatform;
+
+        // Provenance and version of the active custom map. Neither drives any
+        // behaviour; they exist so a pasted log answers "which build of which
+        // level was this?" without having to ask.
+        public static string BundleSource;
+        public static string BundleMapVersion;
+
         private void Awake()
         {
             // Plugin startup logic
@@ -56,7 +104,10 @@ namespace TrickyMaddnessLevelHook
                 + "Auto: only when the game is NOT running on Windows, since maps are overwhelmingly Windows-built. "
                 + "Always: also on Windows - use this if a Mac/Linux-built map renders magenta. "
                 + "Never: disable entirely.");
-            Logger.LogInfo($"Shader remap: mode {ShaderRemap.Value} on {Application.platform} -> {(ShaderRemapEnabled() ? "active" : "inactive")}");
+            //"by default" because in Auto a map that declares its own platform
+            //overrides this per map — so this line is no longer the whole story,
+            //and it's the line people paste into bug reports.
+            Logger.LogInfo($"Shader remap: mode {ShaderRemap.Value} on {Application.platform} -> {(ShaderRemapEnabled() ? "active" : "inactive")} by default");
             levelSelectScroll = Config.Bind("UI", "LevelSelectScroll", true,
                 "Scroll the level-select card strip when more cards exist than fit " +
                 "on screen, auto-scrolling to the selected card. When all cards fit, " +
@@ -327,10 +378,102 @@ namespace TrickyMaddnessLevelHook
             if (ShaderRemap == null) return false;
             if (ShaderRemap.Value == ShaderRemapMode.Never) return false;
             if (ShaderRemap.Value == ShaderRemapMode.Always) return true;
+            // Auto. If the map itself declared which platform its shaders were
+            // compiled for, believe it over the guess below — it is the one
+            // authority that actually knows. That is what lets a Mac- or
+            // Linux-built map be remapped ON WINDOWS (the case the guess cannot
+            // cover and the config entry exists to work around), and equally
+            // lets a genuinely Mac-native map be left alone on a Mac.
+            // Gate on the slug being one we understand, not merely on it being
+            // present, so an unknown or future slug falls through to the guess
+            // below — the same answer this Hook gives today.
+            if (BundleNativePlatform != null && KnownPlatforms.Contains(BundleNativePlatform))
+                return !DeclaredPlatformIsNative(BundleNativePlatform);
             //Auto: everything except Windows, whose bundles are already native.
             var platform = Application.platform;
             return platform != RuntimePlatform.WindowsPlayer
                 && platform != RuntimePlatform.WindowsEditor;
+        }
+
+        // True when a bundle declaring `declared` was built for the platform this
+        // process is running on — i.e. its compiled shader bytecode is native and
+        // must not be touched, because remapping is lossy (it resets keywords and
+        // can drop shader features the map actually shipped). Only ever called
+        // with a slug from KnownPlatforms; it does its own case-insensitive
+        // comparison rather than trusting the caller to have normalised, since
+        // BundleNativePlatform is public and anything could assign it.
+        static bool DeclaredPlatformIsNative(string declared)
+        {
+            var p = Application.platform;
+            if (string.Equals(declared, "windows", StringComparison.OrdinalIgnoreCase))
+                return p == RuntimePlatform.WindowsPlayer || p == RuntimePlatform.WindowsEditor;
+            if (string.Equals(declared, "mac", StringComparison.OrdinalIgnoreCase))
+                return p == RuntimePlatform.OSXPlayer || p == RuntimePlatform.OSXEditor;
+            if (string.Equals(declared, "linux", StringComparison.OrdinalIgnoreCase))
+                return p == RuntimePlatform.LinuxPlayer || p == RuntimePlatform.LinuxEditor;
+            //Unreachable via ReadSidecar, and "no declaration" is the safe answer.
+            return false;
+        }
+
+        // Reads a map's sidecar settings, keyed by the map's .asset path. Returns
+        // an empty set for a map with no sidecar, and never throws: an unreadable
+        // or malformed sidecar has to degrade to "map declares nothing", because
+        // the alternative is a level that used to load refusing to.
+        public static Dictionary<string, string> ReadSidecar(string bundlePath)
+        {
+            var settings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(bundlePath)) return settings;
+
+            string sidecar = null;
+            foreach (var ext in SidecarExtensions)
+            {
+                string candidate = Path.ChangeExtension(bundlePath, ext);
+                if (File.Exists(candidate)) { sidecar = candidate; break; }
+            }
+            if (sidecar == null) return settings;
+
+            try
+            {
+                //Streamed rather than ReadAllLines: a sidecar carrying other
+                //per-map data can run to tens of thousands of lines, and the
+                //settings are a handful of them.
+                using (var reader = new StreamReader(sidecar))
+                {
+                    string raw;
+                    while ((raw = reader.ReadLine()) != null)
+                    {
+                        string line = raw.Trim();
+                        //'#' comments out a WHOLE line only. It is deliberately not
+                        //honoured mid-line, so a value is never silently truncated.
+                        if (line.Length == 0 || line[0] == '#') continue;
+                        int sp = line.IndexOfAny(KeySeparators);
+                        if (sp <= 0) continue;
+                        string key = line.Substring(0, sp);
+                        if (!SidecarKeys.Contains(key)) continue;
+                        string value = line.Substring(sp + 1).Trim();
+                        if (value.Length == 0) continue;
+                        // A platform we don't understand is not a declaration. Say
+                        // so — a silent fallback here reads to the author as "the
+                        // Hook ignored my file", which is the bug report nobody
+                        // can act on.
+                        if (string.Equals(key, "platform", StringComparison.OrdinalIgnoreCase)
+                            && !KnownPlatforms.Contains(value))
+                        {
+                            Log.LogWarning($"[Sidecar] {Path.GetFileName(sidecar)}: "
+                                + $"'platform {value}' is not one of windows/mac/linux — ignoring it. "
+                                + "Shader remap falls back to guessing from the running platform.");
+                            continue;
+                        }
+                        //Last one wins, so a hand-appended line overrides a generated one.
+                        settings[key] = value;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning($"[Sidecar] could not read {Path.GetFileName(sidecar)}: {e.Message}");
+            }
+            return settings;
         }
 
         // Called from the LoadScene prefix immediately BEFORE the bundle is
@@ -533,6 +676,12 @@ namespace TrickyMaddnessLevelHook
                 //handle, not off LoadedAssetBundle — the two can be out of sync.
                 Plugin.LoadedAssetBundle = "";
                 Plugin.LoadedTrack = null;
+                //Built-in levels declare nothing, so clearing here is what keeps
+                //them provably stock: no sidecar of a previously-played custom map
+                //can still be in effect while one is loading.
+                Plugin.BundleNativePlatform = null;
+                Plugin.BundleSource = null;
+                Plugin.BundleMapVersion = null;
                 if (Plugin.myLoadedAssetBundle != null)
                 {
                     Plugin.myLoadedAssetBundle.Unload(true);
@@ -545,6 +694,13 @@ namespace TrickyMaddnessLevelHook
             {
                 string path = levelEntry.sceneName.TrimStart('$');
                 Plugin.Log.LogInfo($"LoadScene prefix: loading custom map bundle '{levelEntry.name}' from {path}");
+
+                //Clear BEFORE anything can fail, matching how LoadedAssetBundle /
+                //LoadedTrack are handled below: every abort path out of this method
+                //then leaves no previous map's declarations still in effect.
+                Plugin.BundleNativePlatform = null;
+                Plugin.BundleSource = null;
+                Plugin.BundleMapVersion = null;
 
                 if (Plugin.LoadedAssetBundle == path && Plugin.myLoadedAssetBundle != null)
                 {
@@ -595,6 +751,27 @@ namespace TrickyMaddnessLevelHook
                     Plugin.myLoadedAssetBundle = bundle;
                     Plugin.LoadedAssetBundle = path;
                     Plugin.LoadedTrack = scenePath[0];
+                }
+
+                //Read the sidecar OUTSIDE the load branch above, so a re-selected
+                //map that reuses its already-loaded bundle still picks up an edited
+                //sidecar. It has to be in effect before the scene loads, because
+                //OnSceneLoaded is what consults ShaderRemapEnabled().
+                var sidecar = Plugin.ReadSidecar(path);
+                string declaredPlatform, declaredSource, declaredVersion;
+                if (sidecar.TryGetValue("platform", out declaredPlatform))
+                    Plugin.BundleNativePlatform = declaredPlatform;
+                if (sidecar.TryGetValue("source", out declaredSource))
+                    Plugin.BundleSource = declaredSource;
+                if (sidecar.TryGetValue("mapversion", out declaredVersion))
+                    Plugin.BundleMapVersion = declaredVersion;
+                if (sidecar.Count > 0)
+                {
+                    Plugin.Log.LogInfo($"[Sidecar] '{levelEntry.name}' declares"
+                        + $" platform={Plugin.BundleNativePlatform ?? "(none)"}"
+                        + $" source={Plugin.BundleSource ?? "(none)"}"
+                        + $" mapversion={Plugin.BundleMapVersion ?? "(none)"}"
+                        + $" -> shader remap {(Plugin.ShaderRemapEnabled() ? "active" : "inactive")}");
                 }
 
                 //Derive the bundle-internal scene name from LoadedTrack. NOT Path.*:
