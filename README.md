@@ -1,5 +1,31 @@
 # TrickyMaddnessLevelHook
- 
+
+## Rail projection fix
+
+`Rail.GetClosestPosition` builds the closest point on a rail segment as
+`segmentStart + segmentVector * t`, where `t` is a distance in metres along the
+segment. That is only correct when the segment happens to be exactly 1 m long —
+the term being scaled has to be the *unit direction*, not the raw segment
+vector. Nothing resamples rails to unit length, so this is off on every rail in
+the game, built-in levels included.
+
+Two things go wrong. The candidate point overshoots by a factor of the segment
+length, so a segment the rider is nowhere near can win the nearest-segment
+contest and the rider gets snapped off the rail line. And at the tail of a rail
+the method reports the rider as still on it, so `Snowboarder` never learns they
+ran off the end and re-attaches them behind where they were. That is the
+rail-end snap-back loop — a human can jump out of it, because jumping is a
+separate exit path, which is why it looks worse on CPU riders.
+
+Config entry `[Gameplay] FixRailProjection`, on by default. Set it false to
+restore stock behaviour.
+
+**This is the one thing the hook changes on built-in levels**, so it is written
+to fail safe: it is a transpiler that reroutes a single `Vector3 * float` call,
+and if it does not find *exactly one* such call in the method — a future game
+update having changed it — it logs a warning and leaves the method completely
+stock rather than guessing which one to rewrite.
+
 ## Custom map thumbnails
 
 A custom map can supply its own level-select thumbnail. Drop a PNG next to the
