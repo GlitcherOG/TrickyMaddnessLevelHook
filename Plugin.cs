@@ -4,6 +4,7 @@ using BepInEx.Logging;
 using HarmonyLib;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Reflection.Emit;
 using TMPro;
@@ -45,6 +46,7 @@ namespace TrickyMaddnessLevelHook
         public static Dictionary<int, HashSet<string>> GameShaderKeywords;
         internal static ConfigEntry<bool> levelSelectScroll;
         internal static ConfigEntry<bool> fixRailProjection;
+        internal static ConfigEntry<bool> mapGravity;
 
         public static string MapsDir;
 
@@ -61,9 +63,11 @@ namespace TrickyMaddnessLevelHook
         //                                 were compiled for. See ShaderRemapEnabled().
         //   source <slug>                 where the level came from, logged only.
         //   mapversion <v>                which build of the level this is, logged only.
+        //   gravity <multiplier>          scales the rider's gravity while this map
+        //                                 is loaded. See ScaledGravity().
         static readonly HashSet<string> SidecarKeys =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "platform", "source", "mapversion" };
+            { "platform", "source", "mapversion", "gravity" };
 
         // Sidecar names tried in order. ".hook.txt" is the name to use. The
         // ".aipaths.txt" fallback is not decoration: a family of converted maps
@@ -96,6 +100,14 @@ namespace TrickyMaddnessLevelHook
         public static string BundleSource;
         public static string BundleMapVersion;
 
+        // Gravity multiplier the active custom map declared, or 1 for every map
+        // that declares nothing — which is every map that exists today. This is
+        // hard-reset to 1 on built-in level selection and on every abort path out
+        // of the load prefix, which is what keeps built-in levels provably stock:
+        // the transpilers below are always installed, but at 1 they hand back the
+        // literal they were given.
+        public static float MapGravityMultiplier = 1f;
+
         private void Awake()
         {
             // Plugin startup logic
@@ -125,6 +137,13 @@ namespace TrickyMaddnessLevelHook
                 + "rail-end snap-back loop; CPU riders never escape it). "
                 + "On by default. Set false to restore the stock behaviour - this is "
                 + "the one thing this Hook changes on built-in levels too.");
+            mapGravity = Config.Bind("Gameplay", "MapGravity", true,
+                "Honour the 'gravity' line in a custom map's sidecar, which lets a "
+                + "map ride heavier or floatier than stock. Only maps that ask for "
+                + "it are affected: built-in levels, and every map that declares no "
+                + "gravity, ride at stock gravity either way. Set false to ignore "
+                + "the setting entirely and leave the game's gravity code "
+                + "completely untouched.");
             MapsDir = ResolveMapsDir();
             Logger.LogInfo($"Maps directory resolved to: {MapsDir}");
             if (!Directory.Exists(MapsDir))
@@ -672,6 +691,64 @@ namespace TrickyMaddnessLevelHook
         {
             return segmentDelta.normalized * distanceAlong;
         }
+
+        // Every patched gravity literal is routed through here at runtime. At the
+        // default multiplier of 1 this returns its argument unchanged, so the
+        // patched methods compute bit-identical results to stock — which is what
+        // built-in levels and every map that declares no gravity always see.
+        public static float ScaledGravity(float baseGravity)
+        {
+            return baseGravity * MapGravityMultiplier;
+        }
+
+        // Routes the gravity literals of one method through ScaledGravity.
+        //
+        // Snowboarder.Gravity and SoftGravity are compile-time consts, so there is
+        // no field to write - the values are baked into each use site as ldc.r4
+        // and can only be caught as literals. Each call site therefore passes only
+        // the values that ARE gravity in that particular method, plus how many it
+        // expects to find: a method can legitimately contain the same number in an
+        // unrelated role (a windup multiplier, say), and blindly scaling those
+        // would break handling in ways nobody would connect back to a gravity
+        // setting.
+        //
+        // Fail-to-stock: if the match count is not exactly `expected`, the method
+        // is returned untouched and the reason is logged. A game update that
+        // changes these methods then costs the feature, never correctness.
+        internal static IEnumerable<CodeInstruction> ScaleGravityLiterals(
+            IEnumerable<CodeInstruction> instructions, string label, float[] values, int expected)
+        {
+            //Materialized rather than a lazy iterator: the count has to be known
+            //before deciding whether to emit anything at all.
+            var code = new List<CodeInstruction>(instructions);
+            if (mapGravity != null && !mapGravity.Value)
+            {
+                Log.LogInfo($"[Gravity] MapGravity off - leaving {label} stock");
+                return code;
+            }
+
+            var hits = new List<int>();
+            for (int i = 0; i < code.Count; i++)
+                if (code[i].opcode == OpCodes.Ldc_R4 && code[i].operand is float f
+                    && Array.IndexOf(values, f) >= 0)
+                    hits.Add(i);
+
+            if (hits.Count != expected)
+            {
+                Log.LogWarning($"[Gravity] {label}: expected {expected} gravity literal(s), "
+                    + $"found {hits.Count} - game updated? Leaving the method stock, so "
+                    + "maps that declare a gravity multiplier will ride at stock gravity.");
+                return code;
+            }
+
+            var scaled = AccessTools.Method(typeof(Plugin), nameof(ScaledGravity));
+            //Walk backwards so each insertion can't shift the indices still to come.
+            for (int i = hits.Count - 1; i >= 0; i--)
+                code.Insert(hits[i] + 1, new CodeInstruction(OpCodes.Call, scaled));
+
+            Log.LogDebug($"[Gravity] {label}: routed {hits.Count} gravity literal(s) through ScaledGravity");
+            return code;
+        }
     }
 
 
@@ -768,6 +845,55 @@ namespace TrickyMaddnessLevelHook
     }
 
 
+    // Per-map gravity. Snowboarder.Gravity (20) and SoftGravity (17) are consts,
+    // so they are inlined at their use sites and there is no field to write - see
+    // Plugin.ScaleGravityLiterals. Exactly three methods carry them, IL-verified
+    // against the shipped Assembly-CSharp:
+    //
+    //   Snowboarder.Integrate      1x 20 (base) + 1x 17 (while rising), out of 36
+    //                              ldc.r4 in the method
+    //   Snowboarder.UpdateGrinding 1x 17, the pull holding the rider onto a rail.
+    //                              Its single 20 is a windup-spring stiffness and
+    //                              is deliberately NOT in this method's value list
+    //   Caster.Cast                1x 20 + 1x 17, the trajectory prediction. It
+    //                              mirrors Integrate exactly (fixedDeltaTime
+    //                              instead of deltaTime) and MUST be scaled with
+    //                              it, or predicted landings drift off the real ones
+    //
+    // Nothing else in the assembly inlines either value as gravity. LaunchPad's
+    // boost - in Snowboarder.OnTriggerEnter and mirrored in Caster.OnEnterTrigger -
+    // also inlines 20, and is left alone on purpose: it is a tag mechanic, not
+    // gravity, and both live in methods this patch never touches.
+    [HarmonyPatch(typeof(Snowboarder), "Integrate")]
+    public class Snowboarder_Integrate_Gravity
+    {
+        [HarmonyTranspiler]
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            return Plugin.ScaleGravityLiterals(instructions, "Snowboarder.Integrate", new[] { 20f, 17f }, 2);
+        }
+    }
+
+    [HarmonyPatch(typeof(Snowboarder), "UpdateGrinding")]
+    public class Snowboarder_UpdateGrinding_Gravity
+    {
+        [HarmonyTranspiler]
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            return Plugin.ScaleGravityLiterals(instructions, "Snowboarder.UpdateGrinding", new[] { 17f }, 1);
+        }
+    }
+
+    [HarmonyPatch(typeof(Caster), "Cast")]
+    public class Caster_Cast_Gravity
+    {
+        [HarmonyTranspiler]
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            return Plugin.ScaleGravityLiterals(instructions, "Caster.Cast", new[] { 20f, 17f }, 2);
+        }
+    }
+
     // The level-load entry point is MenuManager.LoadScene(LevelEntry), NOT
     // SelectLevel. Retail MenuManager exposes SelectLevel(int index) — a different
     // signature — so a patch aimed at SelectLevel(LevelEntry) silently never binds
@@ -797,6 +923,7 @@ namespace TrickyMaddnessLevelHook
                 Plugin.BundleNativePlatform = null;
                 Plugin.BundleSource = null;
                 Plugin.BundleMapVersion = null;
+                Plugin.MapGravityMultiplier = 1f;
                 if (Plugin.myLoadedAssetBundle != null)
                 {
                     Plugin.myLoadedAssetBundle.Unload(true);
@@ -816,6 +943,7 @@ namespace TrickyMaddnessLevelHook
                 Plugin.BundleNativePlatform = null;
                 Plugin.BundleSource = null;
                 Plugin.BundleMapVersion = null;
+                Plugin.MapGravityMultiplier = 1f;
 
                 if (Plugin.LoadedAssetBundle == path && Plugin.myLoadedAssetBundle != null)
                 {
@@ -880,12 +1008,44 @@ namespace TrickyMaddnessLevelHook
                     Plugin.BundleSource = declaredSource;
                 if (sidecar.TryGetValue("mapversion", out declaredVersion))
                     Plugin.BundleMapVersion = declaredVersion;
+                string declaredGravity;
+                if (sidecar.TryGetValue("gravity", out declaredGravity))
+                {
+                    //InvariantCulture on purpose: the sidecar is authored once and
+                    //shipped to everyone, so "1.6" must not become 16 for a player
+                    //whose locale reads ',' as the decimal separator.
+                    float g;
+                    if (!float.TryParse(declaredGravity, NumberStyles.Float,
+                                        CultureInfo.InvariantCulture, out g)
+                        || float.IsNaN(g) || float.IsInfinity(g) || g <= 0f)
+                    {
+                        //Left at 1 rather than clamped: a map asking for gravity 0
+                        //or -3 has a broken sidecar, and stock gravity is the only
+                        //sane thing to fall back to.
+                        Plugin.Log.LogWarning($"[Gravity] '{levelEntry.name}' declares"
+                            + $" gravity '{declaredGravity}', which is not a positive"
+                            + " number - ignoring it and using stock gravity.");
+                    }
+                    else if (Plugin.mapGravity != null && !Plugin.mapGravity.Value)
+                    {
+                        //Left at 1 so the [Sidecar] line below reports what the
+                        //rider will actually feel, not what the map asked for.
+                        Plugin.Log.LogInfo($"[Gravity] '{levelEntry.name}' declares"
+                            + $" gravity {g.ToString(CultureInfo.InvariantCulture)}x,"
+                            + " ignored - MapGravity is off in the config.");
+                    }
+                    else
+                    {
+                        Plugin.MapGravityMultiplier = g;
+                    }
+                }
                 if (sidecar.Count > 0)
                 {
                     Plugin.Log.LogInfo($"[Sidecar] '{levelEntry.name}' declares"
                         + $" platform={Plugin.BundleNativePlatform ?? "(none)"}"
                         + $" source={Plugin.BundleSource ?? "(none)"}"
                         + $" mapversion={Plugin.BundleMapVersion ?? "(none)"}"
+                        + $" gravity={Plugin.MapGravityMultiplier.ToString(CultureInfo.InvariantCulture)}x"
                         + $" -> shader remap {(Plugin.ShaderRemapEnabled() ? "active" : "inactive")}");
                 }
 

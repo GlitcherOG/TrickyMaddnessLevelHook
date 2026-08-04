@@ -81,6 +81,7 @@ key and a value:
 
 ```
 platform mac
+gravity 1.6
 source my_conversion_project
 mapversion 1.2
 ```
@@ -98,6 +99,12 @@ did before. A `#` at the start of a line comments it out.
   your map just working and every player having to be told to flip a setting.
   Any other value is ignored with a warning in the log, and the hook goes back
   to guessing.
+- `gravity` — multiplier on the rider's gravity while this map is loaded. `1`
+  (the default) is stock. Above 1 is heavier: jumps peak lower and land sooner.
+  Below 1 is floatier. This is a *feel* number with no correct value — big
+  courses tend to want more than 1 because a jump that felt right on a normal
+  course covers less of a large one. Anything that isn't a positive number is
+  ignored with a warning, and the map rides at stock gravity.
 - `source` — free-form label for where the level came from. Logged only.
 - `mapversion` — which build of the level this is. Logged only.
 
@@ -109,6 +116,26 @@ safe — `Always` and `Never` are explicit player overrides and still win. If yo
 previously set `Always` to make a macOS- or Linux-built map render, you can put
 it back to `Auto` once that map ships a `platform` line; leaving it on `Always`
 will remap maps that don't need it.
+
+### How `gravity` is applied
+
+The game's gravity values are compile-time constants, so they are baked into
+every place that uses them and there is no field to set. The hook rewrites those
+literals to pass through a multiply instead. Three methods carry them: the
+rider's own integration, the pull that holds a rider onto a rail, and the
+trajectory prediction — that last one has to be scaled in step with the first,
+or the predicted landing drifts away from where the rider actually lands.
+
+The multiplier resets to 1 when a built-in level is selected and on every path
+that abandons a custom map load, and at 1 the rewritten methods compute exactly
+what stock does. Built-in levels are therefore unaffected whatever a custom map
+declared beforehand. If a game update ever changes those methods so the expected
+literals aren't found, the hook leaves them stock and logs it — maps that ask
+for a gravity multiplier just ride at stock gravity until it's fixed.
+
+Config entry `[Gameplay] MapGravity`, on by default. Setting it to `false`
+ignores the `gravity` line entirely and leaves the game's gravity code
+completely untouched — not scaled by 1, but unpatched.
 
 ### Sidecar filenames
 
