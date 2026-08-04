@@ -5,6 +5,7 @@ using HarmonyLib;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection.Emit;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -43,6 +44,7 @@ namespace TrickyMaddnessLevelHook
         public static HashSet<int> GameShaderIds;
         public static Dictionary<int, HashSet<string>> GameShaderKeywords;
         internal static ConfigEntry<bool> levelSelectScroll;
+        internal static ConfigEntry<bool> fixRailProjection;
 
         public static string MapsDir;
 
@@ -112,6 +114,17 @@ namespace TrickyMaddnessLevelHook
                 "Scroll the level-select card strip when more cards exist than fit " +
                 "on screen, auto-scrolling to the selected card. When all cards fit, " +
                 "the menu is left pixel-identical to vanilla. Set false to disable.");
+            fixRailProjection = Config.Bind("Gameplay", "FixRailProjection", true,
+                "Bug fix in the GAME's own Rail.GetClosestPosition: it builds the "
+                + "closest point on a rail segment as 'start + segmentVector * t' "
+                + "where t is a distance in metres, so the projection is only correct "
+                + "on segments exactly 1 m long - and no rail is, stock levels "
+                + "included. The rider can be snapped metres off the rail and, at the "
+                + "tail, the method reports 'still on the rail' when they have run off "
+                + "it, so the game re-attaches them behind where they were (the "
+                + "rail-end snap-back loop; CPU riders never escape it). "
+                + "On by default. Set false to restore the stock behaviour - this is "
+                + "the one thing this Hook changes on built-in levels too.");
             MapsDir = ResolveMapsDir();
             Logger.LogInfo($"Maps directory resolved to: {MapsDir}");
             if (!Directory.Exists(MapsDir))
@@ -649,6 +662,108 @@ namespace TrickyMaddnessLevelHook
             if (!removed) return false;
             mat.shaderKeywords = kept.ToArray();
             return true;
+        }
+
+        // The corrected multiply for Rail.GetClosestPosition's closest-point
+        // formula: the game scales the raw segment vector by a distance in
+        // metres, where only the unit direction may be scaled. See
+        // Rail_GetClosestPosition_Projection for the full story.
+        internal static Vector3 RailProject(Vector3 segmentDelta, float distanceAlong)
+        {
+            return segmentDelta.normalized * distanceAlong;
+        }
+    }
+
+
+    // Rail.GetClosestPosition - fix the closest-point projection.
+    //
+    // IL-verified against Assembly-CSharp. Per segment i the game computes
+    //     d   = seg[i+1].position - seg[i].position      (NOT normalized)
+    //     dir = d.normalized
+    //     len = d.magnitude
+    //     t   = clamp(Dot(rider - seg[i].position, dir), 0, len)   // metres
+    // and then takes the closest point on that segment as
+    //     seg[i].position + d * t                        // <-- wrong term
+    // where it must be dir * t. The two agree only when |d| == 1 m. Nothing
+    // resamples rails to unit length - not the game's own authoring tool
+    // (MakerRails.GenerateSegments emits one Segment per PointList child, no
+    // resampling), and measured spacing is 1.8-7.0 m median across every course
+    // we have looked at, so this is wrong on every rail in the game, built-in
+    // levels included. The rotation and distance lerps further down the same
+    // method both use the correct normalized parameter t/len; the position line
+    // is the lone outlier, which is what makes this read as a typo rather than
+    // as intent.
+    //
+    // Consequence: each segment's candidate point overshoots by a factor of
+    // |d|, so a segment the rider is nowhere near can win the nearest-segment
+    // contest. Measured on one 13-point rail (4.9-5.9 m spans, 65.1 m long) by
+    // walking the rider exactly along the true polyline: the shipped formula
+    // snaps up to 3.55 m off the rail line, and 5% past the tail it returns
+    // end = 0 where the corrected one returns end = 1. `end` and `distance` are
+    // only committed for the winning segment, so picking the wrong segment
+    // corrupts both. Snowboarder gates re-attachment on
+    // `if (end == railDirection) return;` - with end stuck at 0 the game never
+    // learns the rider ran off the end and re-attaches them behind where they
+    // were. That is the rail-end snap-back loop; jumping escapes it because
+    // jumping is a separate exit path, which is why CPU riders (who don't jump
+    // out) stay stuck.
+    //
+    // Surgical fix: the method contains exactly ONE Vector3 * float multiply and
+    // it is that term, so reroute that one call through Plugin.RailProject
+    // (which normalizes first). No local-variable rewriting, nothing else
+    // touched. Bails out unchanged and loudly if the match count isn't exactly
+    // 1, so a future game update degrades to stock behaviour rather than to
+    // corrupted rails.
+    [HarmonyPatch(typeof(Rail), "GetClosestPosition")]
+    public class Rail_GetClosestPosition_Projection
+    {
+        [HarmonyTranspiler]
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var code = new List<CodeInstruction>(instructions);
+            if (!Plugin.fixRailProjection.Value)
+            {
+                Plugin.Log.LogInfo("[Rail] FixRailProjection off - leaving Rail.GetClosestPosition stock");
+                return code;
+            }
+
+            var mul = AccessTools.Method(typeof(Vector3), "op_Multiply",
+                new[] { typeof(Vector3), typeof(float) });
+            var fix = AccessTools.Method(typeof(Plugin), nameof(Plugin.RailProject));
+
+            var hits = new List<int>();
+            for (int i = 0; i < code.Count; i++)
+                if (code[i].opcode == OpCodes.Call && Equals(code[i].operand, mul))
+                    hits.Add(i);
+
+            if (hits.Count != 1)
+            {
+                Plugin.Log.LogWarning($"[Rail] GetClosestPosition: expected exactly 1 Vector3*float multiply, found {hits.Count} - game updated? Leaving the method stock.");
+                return code;
+            }
+
+            code[hits[0]].operand = fix;
+            Plugin.Log.LogInfo("[Rail] GetClosestPosition: closest-point projection corrected (scale the unit direction, not the raw segment vector)");
+            return code;
+        }
+    }
+
+    // SnowTrail (the board's ground-snapped ribbon decal) ground-snaps via a
+    // raycast that only hits Unity layer "Default" (IL-verified: SnowTrail.Start
+    // sets its static layerMask to just 1 << LayerMask.NameToLayer("Default")).
+    // Rideable ground can legitimately be Default(0)/Ice(6)/Rock(7)/Metal(14) -
+    // those are the four layers Snowboarder itself treats as ground - so on any
+    // custom terrain typed onto Ice/Rock/Metal the raycast misses every frame
+    // and the trail never renders. Widen the mask once, right after Start() sets
+    // it, to exactly those four layers.
+    [HarmonyPatch(typeof(SnowTrail), "Start")]
+    public class SnowTrail_Start_LayerMask
+    {
+        [HarmonyPostfix]
+        public static void Postfix()
+        {
+            int rideableMask = (1 << 0) | (1 << 6) | (1 << 7) | (1 << 14);
+            Traverse.Create(typeof(SnowTrail)).Field("layerMask").SetValue(rideableMask);
         }
     }
 
